@@ -1,54 +1,28 @@
+// HTTP 编排层：解析请求 -> 调用 rules.js 判定 -> 交给 store.js 保存。
+// 判定规则不在本层实现。
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadDb, saveDb } from "./src/store.js";
+import {
+  STATUS,
+  STATUSES,
+  applyReading,
+  advance,
+  startInitial,
+  startRegrind,
+  cureProgress,
+  nextStep,
+  regrindAvailableAt,
+  validateCureSpec,
+  formatDuration,
+} from "./src/rules.js";
+import { renderPage } from "./src/page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "ink-stick-testing.json");
 const port = Number(process.env.PORT || 3037);
-const seed = {
-  "items": [
-    {
-      "code": "IS-001",
-      "smokeSource": "黄山松烟",
-      "glueRatio": "7.5%",
-      "ageYears": 8,
-      "storage": "恒湿柜B",
-      "status": "已试磨",
-      "logs": [
-        {
-          "at": "2026-06-11",
-          "step": "试磨",
-          "note": "宣纸20滴水，出墨快，评分86",
-          "score": 86
-        }
-      ]
-    },
-    {
-      "code": "IS-002",
-      "smokeSource": "桐油烟",
-      "glueRatio": "8%",
-      "ageYears": 3,
-      "storage": "试样盒C",
-      "status": "待试磨",
-      "logs": []
-    }
-  ]
-};
-const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-const stages = ["待试磨","已试磨","重点观察"];
-const statLabels = ["待试磨","已试磨","重点观察"];
-const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -62,153 +36,219 @@ function html(res, text) {
   res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
   res.end(text);
 }
-function newId() { return "IS-" + Date.now(); }
-function computeStats(items) {
-  const stats = Object.fromEntries(statLabels.map(label => [label, 0]));
-  for (const item of items) {
-    if (stats[item.status] !== undefined) stats[item.status] += 1;
+
+function num(value, label) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) throw new Error(`${label}必须是数字`);
+  return n;
+}
+function parseAt(value, fallbackMs) {
+  if (value == null || value === "") return fallbackMs;
+  const ms = Date.parse(value);
+  if (!Number.isFinite(ms)) throw new Error("时间格式无效");
+  return ms;
+}
+function findItem(db, id) {
+  return db.items.find((x) => x.id === id || x.code === id);
+}
+
+// 时间流逝带来的流转（养护到期 -> 待初评），每次请求惰性推进，原地更新。
+function advanceAll(db, nowMs) {
+  let changed = false;
+  for (const item of db.items) {
+    const { item: next, events } = advance(item, nowMs);
+    if (events.length) {
+      changed = true;
+      Object.assign(item, next);
+      item.logs = [...(item.logs || []), ...events];
+    }
   }
-  return stats;
+  return changed;
 }
-function summarize(item) {
-  const logCount = (item.logs || []).length + (item.tasks || []).reduce((n, t) => n + (t.logs || []).length, 0);
-  return { ...item, logCount };
-}
-function page() {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>墨锭试磨室</title>
-  <style>
-    :root { --bg:#f1f3ef; --panel:#fff; --ink:#20241f; --muted:#687066; --line:#d4ddd0; --accent:#526f43; --warn:#9b4937; }
-    * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--ink); font-family:Arial,"PingFang SC",sans-serif; }
-    header { padding:22px 28px; background:#fff; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:16px; align-items:center; }
-    h1 { margin:0; font-size:26px; } h2 { margin:0 0 12px; font-size:18px; } main { display:grid; grid-template-columns:380px 1fr; gap:22px; padding:22px 28px; }
-    form,.panel,.card,.stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    label { display:block; margin:10px 0 5px; color:var(--muted); font-size:13px; } input,select,textarea { width:100%; border:1px solid var(--line); border-radius:6px; padding:9px; font:inherit; background:#fff; } textarea { min-height:68px; }
-    button { border:0; border-radius:6px; background:var(--accent); color:#fff; padding:10px 13px; font-weight:700; cursor:pointer; } button.secondary { background:#69736a; }
-    .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-bottom:14px; } .stat strong { display:block; font-size:24px; }
-    .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; } .toolbar select,.toolbar input { width:auto; min-width:160px; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
-    .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
-    .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
-    @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
-  </style>
-</head>
-<body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
-  <main>
-    <section>
-      <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>创建试磨记录</h2><label>选择墨锭</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
-    </section>
-    <section>
-      <div class="stats" id="stats"></div>
-      <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
-      <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
-    </section>
-  </main>
-  <script>
-    const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
-    const stages = ["待试磨","已试磨","重点观察"];
-    const extraFields = [["paper","试磨纸张"],["water","加水量"],["speed","出墨速度"],["colorLayer","墨色层次"],["sediment","沉淀情况"],["score","评分"]];
-    const createForm = document.querySelector('#createForm');
-    const actionForm = document.querySelector('#actionForm');
-    const cards = document.querySelector('#cards');
-    const statsEl = document.querySelector('#stats');
-    const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
-    async function api(path, options) {
-      const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
-      return data;
-    }
-    function renderForms() {
-      document.querySelector('#fields').innerHTML = fields.map(([key,label,type]) => '<label>'+label+'</label><input name="'+key+'" type="'+type+'" '+(key==='code'?'required':'')+'>').join('');
-      document.querySelector('#extraFields').innerHTML = extraFields.map(([key,label]) => '<label>'+label+'</label><input name="'+key+'">').join('');
-    }
-    function render() {
-      itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
-      const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
-      statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
-      const status = document.querySelector('#statusFilter').value;
-      const q = document.querySelector('#search').value.trim();
-      const visible = items.filter(item => (!status || item.status === status) && (!q || JSON.stringify(item).includes(q)));
-      cards.innerHTML = visible.map(item => cardHtml(item)).join('');
-      document.querySelectorAll('[data-status]').forEach(sel => sel.onchange = async () => { await api('/api/items/'+sel.dataset.status, { method:'PATCH', body: JSON.stringify({ status: sel.value }) }); await load(); });
-      document.querySelectorAll('[data-note]').forEach(btn => btn.onclick = async () => { const id = btn.dataset.note; const note = prompt('记录备注'); if (note) { await api('/api/items/'+id+'/logs', { method:'POST', body: JSON.stringify({ step:'备注', note }) }); await load(); } });
-    }
-    function cardHtml(item) {
-      const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
-      const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
-      return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
-    }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
-    document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
-    renderForms(); load();
-  </script>
-</body>
-</html>`;
+
+function summarize(item, nowMs) {
+  const progress = cureProgress(item, nowMs);
+  const c = item.cure;
+  return {
+    ...item,
+    progress: {
+      ...progress,
+      remainingText: progress.done ? "已到期" : formatDuration(progress.remainingMs),
+    },
+    cureText: `${c.requiredMs / (24 * 60 * 60 * 1000)}天`,
+    envText: `${c.tempMin}-${c.tempMax}℃ / ${c.humMin}-${c.humMax}%RH`,
+    nextStep: nextStep(item, nowMs),
+    regrindReady:
+      item.status === STATUS.PENDING_REGRIND &&
+      item.initial &&
+      nowMs >= regrindAvailableAt(item),
+  };
 }
 
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
-    if (req.method === "GET" && url.pathname === "/") return html(res, page());
-    if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    const nowMs = Date.now();
+    const db = await loadDb(dbPath);
+    const advanced = advanceAll(db, nowMs);
+
+    if (req.method === "GET" && url.pathname === "/") return html(res, renderPage());
+
+    if (req.method === "GET" && url.pathname === "/api/items") {
+      if (advanced) await saveDb(dbPath, db);
+      return send(res, 200, db.items.map((i) => summarize(i, nowMs)));
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/stats") {
+      if (advanced) await saveDb(dbPath, db);
+      const stats = Object.fromEntries(STATUSES.map((s) => [s, 0]));
+      for (const item of db.items) stats[item.status] = (stats[item.status] || 0) + 1;
+      return send(res, 200, stats);
+    }
+
+    // 入室建档：绑定生产批次、养护时长与环境范围
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
-      const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
+      const code = String(input.code || "").trim();
+      const batch = String(input.batch || "").trim();
+      if (!code) throw new Error("墨锭编号必填");
+      if (!batch) throw new Error("生产批次必填");
+      if (db.items.some((x) => x.code === code)) throw new Error(`编号 ${code} 已存在`);
+
+      const cure = {
+        requiredMs: num(input.cureDays, "养护时长") * 24 * 60 * 60 * 1000,
+        accumulatedMs: 0,
+        tempMin: num(input.tempMin, "温度下限"),
+        tempMax: num(input.tempMax, "温度上限"),
+        humMin: num(input.humMin, "湿度下限"),
+        humMax: num(input.humMax, "湿度上限"),
+        inRange: true,
+        lastReadingAt: null,
+        pausedAt: null,
+        pauseReason: null,
+      };
+      const specError = validateCureSpec({
+        cureDays: cure.requiredMs / (24 * 60 * 60 * 1000),
+        tempMin: cure.tempMin,
+        tempMax: cure.tempMax,
+        humMin: cure.humMin,
+        humMax: cure.humMax,
+      });
+      if (specError) throw new Error(specError);
+
+      let item = {
+        id: "IS-" + nowMs,
+        code,
+        batch,
+        smokeSource: String(input.smokeSource || "").trim(),
+        glueRatio: String(input.glueRatio || "").trim(),
+        ageYears: input.ageYears === "" || input.ageYears == null ? null : num(input.ageYears, "存放年限"),
+        storage: String(input.storage || "").trim(),
+        enteredAt: new Date(nowMs).toISOString(),
+        cure,
+        status: STATUS.CURING,
+        watchReason: null,
+        initial: null,
+        regrind: null,
+        gradeScore: null,
+        env: [],
+        tests: [],
+        logs: [
+          {
+            at: new Date(nowMs).toISOString(),
+            step: "建档",
+            note: `墨锭入室，批次 ${batch}，养护时长 ${input.cureDays} 天，环境范围 ${cure.tempMin}-${cure.tempMax}℃ / ${cure.humMin}-${cure.humMax}%`,
+          },
+        ],
+      };
+
+      // 入室即时温湿度：作为计时起点；超标则从暂停开始
+      if (input.temp !== "" && input.temp != null && input.humidity !== "" && input.humidity != null) {
+        const result = applyReading(item, {
+          at: nowMs,
+          temp: num(input.temp, "温度"),
+          humidity: num(input.humidity, "湿度"),
+        });
+        item = result.item;
+        item.logs.push(...result.events);
+      }
+
       db.items.unshift(item);
-      await saveDb(db);
-      return send(res, 201, item);
+      await saveDb(dbPath, db);
+      return send(res, 201, summarize(item, nowMs));
     }
-    const patch = url.pathname.match(/^\/api\/items\/([^/]+)$/);
-    if (patch && req.method === "PATCH") {
-      const item = db.items.find(x => x.id === patch[1] || x.code === patch[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
-      Object.assign(item, await body(req));
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: "状态", note: "更新为" + item.status });
-      await saveDb(db);
-      return send(res, 200, item);
-    }
-    const log = url.pathname.match(/^\/api\/items\/([^/]+)\/logs$/);
-    if (log && req.method === "POST") {
-      const item = db.items.find(x => x.id === log[1] || x.code === log[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+
+    // 单锭温湿度登记
+    const reading = url.pathname.match(/^\/api\/items\/([^/]+)\/readings$/);
+    if (reading && req.method === "POST") {
+      const item = findItem(db, decodeURIComponent(reading[1]));
+      if (!item) return send(res, 404, { error: "墨锭不存在" });
+      if (item.status !== STATUS.CURING) {
+        return send(res, 400, { error: `当前状态为「${item.status}」，养护计时已结束，无需登记温湿度` });
+      }
       const input = await body(req);
-      item.logs ||= [];
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "记录", note: input.note || "" });
-      await saveDb(db);
-      return send(res, 201, item);
+      const result = applyReading(item, {
+        at: parseAt(input.at, nowMs),
+        temp: num(input.temp, "温度"),
+        humidity: num(input.humidity, "湿度"),
+      });
+      Object.assign(item, result.item);
+      item.logs = [...(item.logs || []), ...result.events];
+      advanceAll(db, nowMs);
+      await saveDb(dbPath, db);
+      return send(res, 201, summarize(item, nowMs));
     }
-    const action = url.pathname.match(/^\/api\/items\/([^/]+)\/action$/);
-    if (action && req.method === "POST") {
-      const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
-      if (!item) return send(res, 404, { error: "item_not_found" });
+
+    // 按批次温湿度登记：作用于该批次所有养护中的墨锭
+    const batchReading = url.pathname.match(/^\/api\/batches\/([^/]+)\/readings$/);
+    if (batchReading && req.method === "POST") {
+      const batch = decodeURIComponent(batchReading[1]);
       const input = await body(req);
-      item.logs ||= [];
-      const score = Number(input.score || 0);
-      item.tests ||= [];
-      item.tests.push({ at: new Date().toISOString(), ...input, score });
-      item.status = score >= 85 ? "已试磨" : "重点观察";
-      item.logs.push({ at: new Date().toISOString(), step: "试磨", note: (input.paper || "试纸") + "，评分" + score, score });
-      await saveDb(db);
-      return send(res, 201, item);
+      const at = parseAt(input.at, nowMs);
+      const temp = num(input.temp, "温度");
+      const humidity = num(input.humidity, "湿度");
+      const targets = db.items.filter((x) => x.batch === batch && x.status === STATUS.CURING);
+      if (!targets.length) return send(res, 404, { error: `批次「${batch}」没有养护中的墨锭` });
+      const updated = [];
+      for (const item of targets) {
+        const result = applyReading(item, { at, temp, humidity });
+        Object.assign(item, result.item);
+        item.logs = [...(item.logs || []), ...result.events];
+        updated.push(item.code);
+      }
+      advanceAll(db, nowMs);
+      await saveDb(dbPath, db);
+      return send(res, 201, { batch, updated });
     }
-    if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+
+    // 初评：养护未到期会被 rules 拒绝；>=85 进入待复磨，否则重点观察
+    const initial = url.pathname.match(/^\/api\/items\/([^/]+)\/initial$/);
+    if (initial && req.method === "POST") {
+      const item = findItem(db, decodeURIComponent(initial[1]));
+      if (!item) return send(res, 404, { error: "墨锭不存在" });
+      const result = startInitial(item, await body(req), nowMs);
+      Object.assign(item, result.item);
+      item.logs = [...(item.logs || []), ...result.events];
+      await saveDb(dbPath, db);
+      return send(res, 201, summarize(item, nowMs));
+    }
+
+    // 复磨：初评满24小时；低5分或有沉淀转重点观察，否则按复磨结果定级
+    const regrind = url.pathname.match(/^\/api\/items\/([^/]+)\/regrind$/);
+    if (regrind && req.method === "POST") {
+      const item = findItem(db, decodeURIComponent(regrind[1]));
+      if (!item) return send(res, 404, { error: "墨锭不存在" });
+      const result = startRegrind(item, await body(req), nowMs);
+      Object.assign(item, result.item);
+      item.logs = [...(item.logs || []), ...result.events];
+      await saveDb(dbPath, db);
+      return send(res, 201, summarize(item, nowMs));
+    }
+
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, 400, { error: error.message });
   }
 });
+
 server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
